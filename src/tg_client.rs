@@ -16,7 +16,7 @@ use telegram_client::listener::Listener;
 
 use crate::config::Config;
 use futures::task::{Context, Poll};
-use futures::{Future, Stream, StreamExt, TryStreamExt};
+use futures::{Future, StreamExt, TryStreamExt, Stream};
 use std::borrow::Borrow;
 use std::pin::Pin;
 use telegram_client::api::aevent::EventApi;
@@ -99,6 +99,7 @@ impl TgClient {
         &self,
         chat_id: i64,
         offset: i64,
+        limit: i64,
         message_id: i64,
     ) -> RTDResult<Messages> {
         self.api
@@ -106,22 +107,24 @@ impl TgClient {
                 GetChatHistory::builder()
                     .chat_id(chat_id)
                     .offset(offset)
+                    .limit(limit)
                     .from_message_id(message_id)
                     .build(),
             )
             .await
     }
 
-    pub async fn get_chat_history_stream(
+    pub fn get_chat_history_stream(
         self,
         chat_id: i64,
         date: i64,
     ) -> impl Stream<Item = Result<Message, RTDError>> {
         let api = Arc::new(self).clone();
-        futures::stream::unfold((0, api), move |(from_message_id, api)| async move {
-            let history = api.get_chat_history(chat_id, -99, from_message_id).await;
+        futures::stream::unfold((i64::MAX, api), move |(mut from_message_id, api)| async move {
+            println!("from: {}", from_message_id);
+            let history = api.get_chat_history(chat_id, 0, 10, from_message_id).await;
             let mut result_messages: Result<Vec<Message>, RTDError> = Ok(vec![]);
-            let mut from_message_id = i64::MAX;
+            // let mut from_message_id = i64::MAX;
             match history {
                 Ok(messages) => {
                     result_messages = Ok(messages
@@ -144,8 +147,21 @@ impl TgClient {
                 }
                 Err(err) => result_messages = Err(err),
             };
-
-            Some((result_messages, (from_message_id, api)))
+            match result_messages {
+                Ok(messages) => {
+                    if messages.len() > 0 {
+                        println!("ok: {}", from_message_id);
+                        Some((Ok(messages), (from_message_id, api)))
+                    } else {
+                        println!("none");
+                        None
+                    }
+                }
+                Err(err) => {
+                    println!("err: {}", from_message_id);
+                    Some((Err(err), (from_message_id, api)))
+                }
+            }
         })
         .map_ok(|updates| futures::stream::iter(updates.clone()).map(Ok))
         .try_flatten()

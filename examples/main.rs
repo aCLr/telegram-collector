@@ -1,8 +1,13 @@
 use log;
 use simple_logger;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
+
+use chrono::{NaiveDate, NaiveDateTime};
 use tg_collector::config::Config;
 use tg_collector::tg_client::{TgClient, TgUpdate};
+use rtdlib::errors::RTDError;
+use rtdlib::types::Message;
+use futures::stream::StreamExt;
 
 #[tokio::main]
 async fn main() {
@@ -20,15 +25,36 @@ async fn main() {
     api.start_listen_updates(sender);
     api.start();
     let chats = api.search_public_chats("profunctor").await.unwrap();
-    for chat in chats.chat_ids() {
-        let chat = api.get_chat_history_stream(chat, ).await.unwrap();
-        println!("{:?}", chat);
-    }
-    println!("close");
+    let date_time: NaiveDateTime = NaiveDate::from_ymd(2017, 11, 12).and_hms(17, 33, 44);
 
-    loop {
-        let update = receiver.recv().unwrap();
-        println!("{:?}", update);
-    }
-    println!("closed");
+    let mut cursor = Box::pin(api.get_chat_history_stream(chats.chat_ids()[0], date_time.timestamp()));
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+    println!("{:?}", cursor.next().await.unwrap().unwrap().id());
+
+    // println!("close");
+
+    // loop {
+    //     let update = receiver.recv().unwrap();
+    //     println!("{:?}", update);
+    // }
+    // println!("closed");
 }
