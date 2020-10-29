@@ -21,7 +21,7 @@ async fn main() {
     api.start();
     let chats = api.search_public_chats("profunctor").await.unwrap();
     for chat in chats.chat_ids() {
-        let chat = api.get_chat(chat).await.unwrap();
+        let chat = api.get_chat_history_stream(chat, ).await.unwrap();
         println!("{:?}", chat);
     }
     println!("close");

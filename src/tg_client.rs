@@ -18,9 +18,9 @@ use crate::config::Config;
 use futures::task::{Context, Poll};
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use std::borrow::Borrow;
+use std::pin::Pin;
 use telegram_client::api::aevent::EventApi;
 use telegram_client::errors::{TGError, TGResult};
-use std::pin::Pin;
 
 pub struct TgClient {
     client: Client,
@@ -89,35 +89,65 @@ impl TgClient {
             .await
     }
 
-    pub async fn join_chat(&self, chat_id: &i64) -> RTDResult<(Ok)> {
+    pub async fn join_chat(&self, chat_id: &i64) -> RTDResult<Ok> {
         self.api
             .join_chat(JoinChat::builder().chat_id(*chat_id).build())
             .await
     }
 
-    pub async fn get_chat_history(&self, chat_id: i64, offset: i64, message_id: i64) -> RTDResult<Messages> {
+    pub async fn get_chat_history(
+        &self,
+        chat_id: i64,
+        offset: i64,
+        message_id: i64,
+    ) -> RTDResult<Messages> {
         self.api
-            .get_chat_history(GetChatHistory::builder().chat_id(chat_id).offset(offset).from_message_id(message_id).build())
+            .get_chat_history(
+                GetChatHistory::builder()
+                    .chat_id(chat_id)
+                    .offset(offset)
+                    .from_message_id(message_id)
+                    .build(),
+            )
             .await
     }
 
-    pub async fn get_chat_history_stream(self, chat_id: i64, date: i64)-> impl Stream<Item = Result<Option<Message>, RTDError>> {
+    pub async fn get_chat_history_stream(
+        self,
+        chat_id: i64,
+        date: i64,
+    ) -> impl Stream<Item = Result<Message, RTDError>> {
         let api = Arc::new(self).clone();
-        futures::stream::unfold(
-            (0, api),
-            move |(from_message_id, api)| async move {
-                let history = api.get_chat_history(chat_id, -99, from_message_id).await;
-                let from_message_id = match &history {
-                    Ok(messages) => {Ok(messages.messages().iter().map(|m|m.as_ref().unwrap().id()).min().map(|min_message_id|min_message_id - 1))}
-                    Err(err) => {Err(err)}
-                };
-                match from_message_id {
-                    Ok(from_message_id) => {Some((history, (from_message_id.unwrap(), api)))}
-                    Err(err) => {None}
+        futures::stream::unfold((0, api), move |(from_message_id, api)| async move {
+            let history = api.get_chat_history(chat_id, -99, from_message_id).await;
+            let mut result_messages: Result<Vec<Message>, RTDError> = Ok(vec![]);
+            let mut from_message_id = i64::MAX;
+            match history {
+                Ok(messages) => {
+                    result_messages = Ok(messages
+                        .messages()
+                        .iter()
+                        .filter_map(|msg| match msg {
+                            None => None,
+                            Some(msg) => {
+                                if msg.date() <= date {
+                                    None
+                                } else {
+                                    if msg.id() < from_message_id {
+                                        from_message_id = msg.id()
+                                    }
+                                    Some(msg.clone())
+                                }
+                            }
+                        })
+                        .collect());
                 }
-            },
-        )
-        .map_ok(|updates| futures::stream::iter(updates.messages().clone()).map(Ok))
+                Err(err) => result_messages = Err(err),
+            };
+
+            Some((result_messages, (from_message_id, api)))
+        })
+        .map_ok(|updates| futures::stream::iter(updates.clone()).map(Ok))
         .try_flatten()
     }
 
