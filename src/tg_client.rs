@@ -7,7 +7,7 @@ use rtdlib::types::{
     UpdateSupergroupFullInfo,
 };
 use std::io;
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use telegram_client::api::aasync::AsyncApi;
 use telegram_client::api::Api;
@@ -21,11 +21,12 @@ use std::borrow::Borrow;
 use std::pin::Pin;
 use telegram_client::api::aevent::EventApi;
 use telegram_client::errors::{TGError, TGResult};
+use std::sync::mpsc::SendError;
 
+#[derive(Clone)]
 pub struct TgClient {
     client: Client,
     api: AsyncApi,
-    join_handle: Option<JoinHandle<()>>,
     have_authorization: Arc<(Mutex<bool>, Condvar)>,
 }
 
@@ -38,7 +39,6 @@ impl TgClient {
         let mut tg = TgClient {
             client,
             api: api,
-            join_handle: None,
             have_authorization: Arc::new((Mutex::new(false), Condvar::new())),
         };
         tg.auth(config);
@@ -67,14 +67,14 @@ impl TgClient {
         ));
     }
 
-    pub fn start(&mut self) {
-        self.join_handle = Some(self.client.start());
-
+    pub fn start(&mut self) -> JoinHandle<()> {
+        let join_handle = self.client.start();
         let (lock, cvar) = &*self.have_authorization;
         let mut started = lock.lock().unwrap();
         while !*started {
             started = cvar.wait(started).unwrap();
         }
+        join_handle
     }
 
     pub async fn get_chat(&self, chat_id: &i64) -> RTDResult<Chat> {
@@ -115,12 +115,13 @@ impl TgClient {
     }
 
     pub fn get_chat_history_stream(
-        self,
+        client: Arc<RwLock<TgClient>>,
         chat_id: i64,
         date: i64,
     ) -> impl Stream<Item = Result<Message, RTDError>> {
-        let api = Arc::new(self).clone();
-        futures::stream::unfold((i64::MAX, api), move |(mut from_message_id, api)| async move {
+        futures::stream::unfold((i64::MAX, client), move |(mut from_message_id, client)| async move {
+            let guard = client.clone();
+            let api = guard.read().unwrap();
             println!("from: {}", from_message_id);
             let history = api.get_chat_history(chat_id, 0, 10, from_message_id).await;
             let mut result_messages: Result<Vec<Message>, RTDError> = Ok(vec![]);
@@ -151,7 +152,7 @@ impl TgClient {
                 Ok(messages) => {
                     if messages.len() > 0 {
                         println!("ok: {}", from_message_id);
-                        Some((Ok(messages), (from_message_id, api)))
+                        Some((Ok(messages), (from_message_id, client)))
                     } else {
                         println!("none");
                         None
@@ -159,7 +160,7 @@ impl TgClient {
                 }
                 Err(err) => {
                     println!("err: {}", from_message_id);
-                    Some((Err(err), (from_message_id, api)))
+                    Some((Err(err), (from_message_id, client)))
                 }
             }
         })
@@ -169,9 +170,6 @@ impl TgClient {
 
     pub async fn close(&mut self) {
         self.api.close(Close::builder().build()).await.unwrap();
-        if let Some(join_handle) = self.join_handle.take() {
-            join_handle.join().unwrap();
-        }
     }
 }
 
@@ -294,9 +292,11 @@ fn get_update_supergroup_full_info_handler(
 ) -> impl Fn((&EventApi, &UpdateSupergroupFullInfo)) -> TGResult<()> + 'static {
     move |(api, update)| {
         let local = channel.lock().unwrap();
-        local
-            .send(TgUpdate::SupergroupFullInfo(update.clone()))
-            .unwrap();
+        match local
+            .send(TgUpdate::SupergroupFullInfo(update.clone())) {
+            Err(err) => {println!("{:?}", err)}
+            _ => {}
+        }
         Ok(())
     }
 }
