@@ -1,8 +1,7 @@
-use rtdlib::errors::{RTDError, RTDResult};
 use rtdlib::types::{
     Chat, Chats, CheckAuthenticationCode, Close, GetChat, GetChatHistory, JoinChat, Message,
     Messages, Ok, SearchPublicChats, SetAuthenticationPhoneNumber, SetDatabaseEncryptionKey,
-    SetTdlibParameters, TdlibParameters, Update, UpdateAuthorizationState, UpdateChatPhoto,
+    SetTdlibParameters, TdlibParameters, UpdateAuthorizationState, UpdateChatPhoto,
     UpdateChatTitle, UpdateMessageContent, UpdateNewMessage, UpdateSupergroup,
     UpdateSupergroupFullInfo,
 };
@@ -12,16 +11,12 @@ use std::thread::JoinHandle;
 use telegram_client::api::aasync::AsyncApi;
 use telegram_client::api::Api;
 use telegram_client::client::Client;
-use telegram_client::listener::Listener;
 
 use crate::config::Config;
-use futures::task::{Context, Poll};
-use futures::{Future, StreamExt, TryStreamExt, Stream};
-use std::borrow::Borrow;
-use std::pin::Pin;
+use crate::error::Result;
+use futures::{Stream, StreamExt, TryStreamExt};
 use telegram_client::api::aevent::EventApi;
-use telegram_client::errors::{TGError, TGResult};
-use std::sync::mpsc::SendError;
+use telegram_client::errors::TGResult;
 
 #[derive(Clone)]
 pub struct TgClient {
@@ -32,7 +27,8 @@ pub struct TgClient {
 
 impl TgClient {
     pub fn new(config: &Config) -> Self {
-        Client::set_log_verbosity_level(config.log_verbosity_level);
+        Client::set_log_verbosity_level(config.log_verbosity_level)
+            .expect("can't change tdlib loglevel");
         let api = Api::rasync();
         let mut client = Client::new(api.api().clone());
         client.warn_unregister_listener(false);
@@ -77,22 +73,25 @@ impl TgClient {
         join_handle
     }
 
-    pub async fn get_chat(&self, chat_id: &i64) -> RTDResult<Chat> {
-        self.api
+    pub async fn get_chat(&self, chat_id: &i64) -> Result<Chat> {
+        Ok(self
+            .api
             .get_chat(GetChat::builder().chat_id(*chat_id).build())
-            .await
+            .await?)
     }
 
-    pub async fn search_public_chats(&self, query: &str) -> RTDResult<Chats> {
-        self.api
+    pub async fn search_public_chats(&self, query: &str) -> Result<Chats> {
+        Ok(self
+            .api
             .search_public_chats(SearchPublicChats::builder().query(query).build())
-            .await
+            .await?)
     }
 
-    pub async fn join_chat(&self, chat_id: &i64) -> RTDResult<Ok> {
-        self.api
+    pub async fn join_chat(&self, chat_id: &i64) -> Result<Ok> {
+        Ok(self
+            .api
             .join_chat(JoinChat::builder().chat_id(*chat_id).build())
-            .await
+            .await?)
     }
 
     pub async fn get_chat_history(
@@ -101,8 +100,9 @@ impl TgClient {
         offset: i64,
         limit: i64,
         message_id: i64,
-    ) -> RTDResult<Messages> {
-        self.api
+    ) -> Result<Messages> {
+        Ok(self
+            .api
             .get_chat_history(
                 GetChatHistory::builder()
                     .chat_id(chat_id)
@@ -111,59 +111,56 @@ impl TgClient {
                     .from_message_id(message_id)
                     .build(),
             )
-            .await
+            .await?)
     }
 
     pub fn get_chat_history_stream(
         client: Arc<RwLock<TgClient>>,
         chat_id: i64,
         date: i64,
-    ) -> impl Stream<Item = Result<Message, RTDError>> {
-        futures::stream::unfold((i64::MAX, client), move |(mut from_message_id, client)| async move {
-            let guard = client.clone();
-            let api = guard.read().unwrap();
-            println!("from: {}", from_message_id);
-            let history = api.get_chat_history(chat_id, 0, 10, from_message_id).await;
-            let mut result_messages: Result<Vec<Message>, RTDError> = Ok(vec![]);
-            // let mut from_message_id = i64::MAX;
-            match history {
-                Ok(messages) => {
-                    result_messages = Ok(messages
-                        .messages()
-                        .iter()
-                        .filter_map(|msg| match msg {
-                            None => None,
-                            Some(msg) => {
-                                if msg.date() <= date {
-                                    None
-                                } else {
-                                    if msg.id() < from_message_id {
-                                        from_message_id = msg.id()
+    ) -> impl Stream<Item = Result<Message>> {
+        futures::stream::unfold(
+            (i64::MAX, client),
+            move |(mut from_message_id, client)| async move {
+                let guard = client.clone();
+                let api = guard.read().unwrap();
+                let history = api.get_chat_history(chat_id, 0, 10, from_message_id).await;
+                let result_messages: Result<Vec<Message>>;
+                // let mut from_message_id = i64::MAX;
+                match history {
+                    Ok(messages) => {
+                        result_messages = Ok(messages
+                            .messages()
+                            .iter()
+                            .filter_map(|msg| match msg {
+                                None => None,
+                                Some(msg) => {
+                                    if msg.date() < date {
+                                        None
+                                    } else {
+                                        if msg.id() < from_message_id {
+                                            from_message_id = msg.id()
+                                        }
+                                        Some(msg.clone())
                                     }
-                                    Some(msg.clone())
                                 }
-                            }
-                        })
-                        .collect());
-                }
-                Err(err) => result_messages = Err(err),
-            };
-            match result_messages {
-                Ok(messages) => {
-                    if messages.len() > 0 {
-                        println!("ok: {}", from_message_id);
-                        Some((Ok(messages), (from_message_id, client)))
-                    } else {
-                        println!("none");
-                        None
+                            })
+                            .collect());
                     }
+                    Err(err) => result_messages = Err(err),
+                };
+                match result_messages {
+                    Ok(messages) => {
+                        if messages.len() > 0 {
+                            Some((Ok(messages), (from_message_id, client)))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(err) => Some((Err(err), (from_message_id, client))),
                 }
-                Err(err) => {
-                    println!("err: {}", from_message_id);
-                    Some((Err(err), (from_message_id, client)))
-                }
-            }
-        })
+            },
+        )
         .map_ok(|updates| futures::stream::iter(updates.clone()).map(Ok))
         .try_flatten()
     }
@@ -239,7 +236,7 @@ fn get_auth_state_handler(
 fn get_new_message_handler(
     channel: Arc<Mutex<mpsc::Sender<TgUpdate>>>,
 ) -> impl Fn((&EventApi, &UpdateNewMessage)) -> TGResult<()> + 'static {
-    move |(api, update)| {
+    move |(_, update)| {
         let local = channel.lock().unwrap();
         local.send(TgUpdate::NewMessage(update.clone())).unwrap();
         Ok(())
@@ -249,7 +246,7 @@ fn get_new_message_handler(
 fn get_update_content_handler(
     channel: Arc<Mutex<mpsc::Sender<TgUpdate>>>,
 ) -> impl Fn((&EventApi, &UpdateMessageContent)) -> TGResult<()> + 'static {
-    move |(api, update)| {
+    move |(_, update)| {
         let local = channel.lock().unwrap();
         local
             .send(TgUpdate::MessageContent(update.clone()))
@@ -261,7 +258,7 @@ fn get_update_content_handler(
 fn get_update_chat_photo_handler(
     channel: Arc<Mutex<mpsc::Sender<TgUpdate>>>,
 ) -> impl Fn((&EventApi, &UpdateChatPhoto)) -> TGResult<()> + 'static {
-    move |(api, update)| {
+    move |(_, update)| {
         let local = channel.lock().unwrap();
         local.send(TgUpdate::ChatPhoto(update.clone())).unwrap();
         Ok(())
@@ -271,7 +268,7 @@ fn get_update_chat_photo_handler(
 fn get_update_chat_title_handler(
     channel: Arc<Mutex<mpsc::Sender<TgUpdate>>>,
 ) -> impl Fn((&EventApi, &UpdateChatTitle)) -> TGResult<()> + 'static {
-    move |(api, update)| {
+    move |(_, update)| {
         let local = channel.lock().unwrap();
         local.send(TgUpdate::ChatTitle(update.clone())).unwrap();
         Ok(())
@@ -281,7 +278,7 @@ fn get_update_chat_title_handler(
 fn get_update_supergroup_handler(
     channel: Arc<Mutex<mpsc::Sender<TgUpdate>>>,
 ) -> impl Fn((&EventApi, &UpdateSupergroup)) -> TGResult<()> + 'static {
-    move |(api, update)| {
+    move |(_, update)| {
         let local = channel.lock().unwrap();
         local.send(TgUpdate::Supergroup(update.clone())).unwrap();
         Ok(())
@@ -290,11 +287,10 @@ fn get_update_supergroup_handler(
 fn get_update_supergroup_full_info_handler(
     channel: Arc<Mutex<mpsc::Sender<TgUpdate>>>,
 ) -> impl Fn((&EventApi, &UpdateSupergroupFullInfo)) -> TGResult<()> + 'static {
-    move |(api, update)| {
+    move |(_, update)| {
         let local = channel.lock().unwrap();
-        match local
-            .send(TgUpdate::SupergroupFullInfo(update.clone())) {
-            Err(err) => {println!("{:?}", err)}
+        match local.send(TgUpdate::SupergroupFullInfo(update.clone())) {
+            Err(err) => println!("{:?}", err),
             _ => {}
         }
         Ok(())
