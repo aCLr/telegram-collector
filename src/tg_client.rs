@@ -235,88 +235,40 @@ fn get_auth_state_handler(
     }
 }
 
-fn get_new_message_handler(
-    channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-) -> impl Fn((&EventApi, &UpdateNewMessage)) -> TGResult<()> + 'static {
-    let rt = runtime::Builder::new_current_thread().build().unwrap();
-    move |(_, update)| {
-        rt.block_on(async {
-            let local = channel.lock().await;
-            local.send(TgUpdate::NewMessage(update.clone())).await;
-        });
-        Ok(())
-    }
+macro_rules! get_handler_func {
+    ($fn: ident, $orig_update_name:ident, $tg_update_name:ident) => {
+        fn $fn(
+            channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
+        ) -> impl Fn((&EventApi, &$orig_update_name)) -> TGResult<()> + 'static {
+            let rt = runtime::Builder::new_current_thread().build().unwrap();
+            move |(_, update)| {
+                rt.block_on(async {
+                    let local = channel.lock().await;
+                    match local.send(TgUpdate::$tg_update_name(update.clone())).await {
+                        Err(err) => warn!("{}", err),
+                        Ok(_) => {}
+                    };
+                });
+                Ok(())
+            }
+        }
+    };
 }
 
-fn get_update_content_handler(
-    channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-) -> impl Fn((&EventApi, &UpdateMessageContent)) -> TGResult<()> + 'static {
-    let rt = runtime::Builder::new_current_thread().build().unwrap();
-    move |(_, update)| {
-        rt.block_on(async {
-            let local = channel.lock().await;
-            local.send(TgUpdate::MessageContent(update.clone())).await;
-        });
-        Ok(())
-    }
-}
-
-fn get_update_chat_photo_handler(
-    channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-) -> impl Fn((&EventApi, &UpdateChatPhoto)) -> TGResult<()> + 'static {
-    let rt = runtime::Builder::new_current_thread().build().unwrap();
-    move |(_, update)| {
-        rt.block_on(async {
-            let local = channel.lock().await;
-            local.send(TgUpdate::ChatPhoto(update.clone())).await;
-        });
-        Ok(())
-    }
-}
-
-fn get_update_chat_title_handler(
-    channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-) -> impl Fn((&EventApi, &UpdateChatTitle)) -> TGResult<()> + 'static {
-    let rt = runtime::Builder::new_current_thread().build().unwrap();
-    move |(_, update)| {
-        rt.block_on(async {
-            let local = channel.lock().await;
-            local.send(TgUpdate::ChatTitle(update.clone())).await;
-        });
-        Ok(())
-    }
-}
-
-fn get_update_supergroup_handler(
-    channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-) -> impl Fn((&EventApi, &UpdateSupergroup)) -> TGResult<()> + 'static {
-    let rt = runtime::Builder::new_current_thread().build().unwrap();
-    move |(_, update)| {
-        rt.block_on(async {
-            let local = channel.lock().await;
-            local.send(TgUpdate::Supergroup(update.clone())).await;
-        });
-        Ok(())
-    }
-}
-fn get_update_supergroup_full_info_handler(
-    channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-) -> impl Fn((&EventApi, &UpdateSupergroupFullInfo)) -> TGResult<()> + 'static {
-    let rt = runtime::Builder::new_current_thread().build().unwrap();
-    move |(_, update)| {
-        rt.block_on(async {
-            let local = channel.lock().await;
-            match local
-                .send(TgUpdate::SupergroupFullInfo(update.clone()))
-                .await
-            {
-                Err(err) => println!("{:?}", err),
-                _ => {}
-            };
-        });
-        Ok(())
-    }
-}
+get_handler_func!(get_new_message_handler, UpdateNewMessage, NewMessage);
+get_handler_func!(
+    get_update_content_handler,
+    UpdateMessageContent,
+    MessageContent
+);
+get_handler_func!(get_update_chat_photo_handler, UpdateChatPhoto, ChatPhoto);
+get_handler_func!(get_update_chat_title_handler, UpdateChatTitle, ChatTitle);
+get_handler_func!(get_update_supergroup_handler, UpdateSupergroup, Supergroup);
+get_handler_func!(
+    get_update_supergroup_full_info_handler,
+    UpdateSupergroupFullInfo,
+    SupergroupFullInfo
+);
 
 #[derive(Debug)]
 pub enum TgUpdate {
