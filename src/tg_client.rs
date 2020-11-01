@@ -240,10 +240,10 @@ macro_rules! get_handler_func {
         fn $fn(
             channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
         ) -> impl Fn((&EventApi, &$orig_update_name)) -> TGResult<()> + 'static {
-            let rt = runtime::Builder::new_current_thread().build().unwrap();
             move |(_, update)| {
+                let mut rt = runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    let local = channel.lock().await;
+                    let mut local = channel.lock().await;
                     match local.send(TgUpdate::$tg_update_name(update.clone())).await {
                         Err(err) => warn!("{}", err),
                         Ok(_) => {}
