@@ -2,22 +2,20 @@ use rtdlib::errors::RTDError;
 use std::fmt;
 
 #[derive(Debug)]
-pub struct Error {
-    message: String,
+pub enum Error {
+    Common(String)
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{:?}", self)
     }
 }
 
 impl From<RTDError> for Error {
     fn from(err: RTDError) -> Self {
-        Self {
-            message: err.to_string(),
-        }
+        Self::Common(err.to_string())
     }
 }

@@ -13,7 +13,7 @@ use telegram_client::api::Api;
 use telegram_client::client::Client;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::result::Result;
 use futures::{Stream, StreamExt, TryStreamExt};
 use telegram_client::api::aevent::EventApi;
 use telegram_client::errors::TGResult;
