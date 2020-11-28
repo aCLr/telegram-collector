@@ -1,9 +1,9 @@
 use rtdlib::types::{
-    Chat, Chats, CheckAuthenticationCode, Close, GetChat, GetChatHistory, JoinChat, Message,
-    Messages, Ok, SearchPublicChats, SetAuthenticationPhoneNumber, SetDatabaseEncryptionKey,
-    SetTdlibParameters, TdlibParameters, UpdateAuthorizationState, UpdateChatPhoto,
-    UpdateChatTitle, UpdateMessageContent, UpdateNewMessage, UpdateSupergroup,
-    UpdateSupergroupFullInfo,
+    Chat, ChatType, Chats, CheckAuthenticationCode, Close, GetChat, GetChatHistory, GetChats,
+    GetSupergroup, GetSupergroupFullInfo, JoinChat, Message, Messages, Ok, SearchPublicChats,
+    SetAuthenticationPhoneNumber, SetDatabaseEncryptionKey, SetTdlibParameters, TdlibParameters,
+    UpdateAuthorizationState, UpdateChatPhoto, UpdateChatTitle, UpdateMessageContent,
+    UpdateNewMessage, UpdateSupergroup, UpdateSupergroupFullInfo,
 };
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
@@ -14,6 +14,9 @@ use telegram_client::client::Client;
 
 use crate::config::Config;
 use crate::result::Result;
+use crate::types;
+use crate::types::Channel;
+use futures::future::join_all;
 use futures::{Stream, StreamExt, TryStreamExt};
 use telegram_client::api::aevent::EventApi;
 use telegram_client::errors::TGResult;
@@ -82,11 +85,12 @@ impl TgClient {
             .await?)
     }
 
-    pub async fn search_public_chats(&self, query: &str) -> Result<Chats> {
-        Ok(self
+    pub async fn search_public_chats(&self, query: &str) -> Result<Vec<types::Channel>> {
+        let chats = self
             .api
             .search_public_chats(SearchPublicChats::builder().query(query).build())
-            .await?)
+            .await?;
+        Ok(self.convert_chats_to_channels(chats).await?)
     }
 
     pub async fn join_chat(&self, chat_id: &i64) -> Result<Ok> {
@@ -94,6 +98,52 @@ impl TgClient {
             .api
             .join_chat(JoinChat::builder().chat_id(*chat_id).build())
             .await?)
+    }
+
+    pub async fn get_channel(&self, chat_id: i64) -> Result<Option<types::Channel>> {
+        let chat = self
+            .api
+            .get_chat(GetChat::builder().chat_id(chat_id).build())
+            .await?;
+        match &chat.type_() {
+            ChatType::Supergroup(sg) if sg.is_channel() => {
+                let sg_info = self
+                    .api
+                    .get_supergroup_full_info(
+                        GetSupergroupFullInfo::builder()
+                            .supergroup_id(sg.supergroup_id())
+                            .build(),
+                    )
+                    .await?;
+                Ok(Some(types::Channel::convert(&chat, &sg_info)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn convert_chats_to_channels(&self, chats: Chats) -> Result<Vec<types::Channel>> {
+        let channels = join_all(chats.chat_ids().into_iter().map(|&c| self.get_channel(c))).await;
+        let mut result = vec![];
+        for channel in channels {
+            match channel? {
+                Some(ch) => result.push(ch),
+                None => {}
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn get_all_channels(&self, limit: i64) -> Result<Vec<types::Channel>> {
+        let chats = self
+            .api
+            .get_chats(
+                GetChats::builder()
+                    .limit(limit)
+                    .offset_order(9223372036854775807)
+                    .build(),
+            )
+            .await?;
+        Ok(self.convert_chats_to_channels(chats).await?)
     }
 
     pub async fn get_chat_history(
@@ -128,7 +178,6 @@ impl TgClient {
                 let api = guard.read().await;
                 let history = api.get_chat_history(chat_id, 0, 10, from_message_id).await;
                 let result_messages: Result<Vec<Message>>;
-                // let mut from_message_id = i64::MAX;
                 match history {
                     Ok(messages) => {
                         result_messages = Ok(messages
@@ -176,7 +225,7 @@ fn type_in() -> String {
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
         Ok(_) => input.trim().to_string(),
-        Err(e) => panic!("Can not get input value: {:?}", e),
+        Err(e) => panic!("Can't get input value: {:?}", e),
     }
 }
 

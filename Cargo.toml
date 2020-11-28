@@ -8,8 +8,10 @@ edition = "2018"
 
 [dependencies]
 tokio = {version = "0.2.22", features = ["full"]}
-telegram-client = { path = "../../telegram-client"}
+#rtdlib = { git = "https://github.com/aCLr/rtdlib.git", branch = "async-client", features = [ "sys" ] }
 rtdlib = { path = "../../rtdlib", features = [ "sys" ] }
+#telegram-client = { git = "https://github.com/aCLr/telegram-client.git", branch = "telegram-client/issues/15" }
+telegram-client = { path = "../../telegram-client"}
 futures = "0.3.7"
 futures-util = "0.3.7"
 log = "0.4"

@@ -12,7 +12,7 @@ use tokio::task::spawn;
 #[tokio::main]
 async fn main() {
     simple_logger::init().unwrap();
-    log::set_max_level("DEBUG".parse().unwrap());
+    log::set_max_level("INFO".parse().unwrap());
     let conf = Config {
         log_verbosity_level: 0,
         database_directory: "tdlib".to_string(),
@@ -32,26 +32,31 @@ async fn main() {
         println!("start");
         join_handle.replace(Some(guard.start()));
         println!("search");
-        guard.search_public_chats("profunctor").await.unwrap()
+        let s = guard.search_public_chats("profunctor").await;
+        println!("{:?}", s);
+        s.unwrap()
     };
     println!("chats: {:?}", chats);
     let date_time: NaiveDateTime = NaiveDate::from_ymd(2020, 10, 26).and_hms(9, 15, 52);
     let mut cursor = Box::pin(TgClient::get_chat_history_stream(
-        main_api,
+        main_api.clone(),
         chats.chat_ids()[0],
         date_time.timestamp(),
     ));
-    let receiver = Mutex::new(receiver);
-    spawn(async move {
-        loop {
-            let update = receiver.lock().await.recv().await;
-            println!("{:?}", update);
-        }
-    });
-    while let Some(message) = cursor.next().await {
-        println!(
-            "{:?}",
-            NaiveDateTime::from_timestamp(message.unwrap().date(), 0)
-        );
-    }
+    let all_chats = main_api.read().await.get_all_channels(10).await;
+    println!("{:?}", all_chats);
+    //
+    // let receiver = Mutex::new(receiver);
+    // spawn(async move {
+    //     loop {
+    //         let update = receiver.lock().await.recv().await;
+    //         println!("{:?}", update);
+    //     }
+    // });
+    // while let Some(message) = cursor.next().await {
+    //     println!(
+    //         "{:?}",
+    //         NaiveDateTime::from_timestamp(message.unwrap().date(), 0)
+    //     );
+    // }
 }
