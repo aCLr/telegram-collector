@@ -3,7 +3,7 @@ use rtdlib::types::{
     GetSupergroup, GetSupergroupFullInfo, JoinChat, Message, Messages, Ok, SearchPublicChats,
     SetAuthenticationPhoneNumber, SetDatabaseEncryptionKey, SetTdlibParameters, TdlibParameters,
     UpdateAuthorizationState, UpdateChatPhoto, UpdateChatTitle, UpdateMessageContent,
-    UpdateNewMessage, UpdateSupergroup, UpdateSupergroupFullInfo,
+    UpdateNewMessage, UpdateSupergroup, UpdateSupergroupFullInfo, GetMessageLink
 };
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
@@ -115,7 +115,15 @@ impl TgClient {
                             .build(),
                     )
                     .await?;
-                Ok(Some(types::Channel::convert(&chat, &sg_info)))
+                let sg = self
+                    .api
+                    .get_supergroup(
+                        GetSupergroup::builder()
+                            .supergroup_id(sg.supergroup_id())
+                            .build(),
+                    )
+                    .await?;
+                Ok(Some(types::Channel::convert(&chat, &sg, &sg_info)))
             }
             _ => Ok(None),
         }
@@ -164,6 +172,10 @@ impl TgClient {
                     .build(),
             )
             .await?)
+    }
+
+    pub async fn get_message_link(&self, chat_id: i64, message_id: i64) -> Result<String> {
+        Ok(self.api.get_message_link(GetMessageLink::builder().chat_id(chat_id).message_id(message_id).build()).await?.url().clone())
     }
 
     pub fn get_chat_history_stream(
