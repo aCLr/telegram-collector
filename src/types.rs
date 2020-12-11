@@ -9,7 +9,11 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub fn convert(chat: &Chat, supergroup: &Supergroup, supergroup_full_info: &SupergroupFullInfo) -> Self {
+    pub fn convert(
+        chat: &Chat,
+        supergroup: &Supergroup,
+        supergroup_full_info: &SupergroupFullInfo,
+    ) -> Self {
         Channel {
             chat_id: chat.id(),
             title: chat.title().clone(),

@@ -14,6 +14,7 @@ async fn main() {
     simple_logger::init().unwrap();
     log::set_max_level("INFO".parse().unwrap());
     let conf = Config {
+        max_download_queue_size: 1,
         log_verbosity_level: 0,
         database_directory: "tdlib".to_string(),
         api_id: env!("API_ID").parse().unwrap(),
@@ -37,12 +38,7 @@ async fn main() {
         s.unwrap()
     };
     println!("chats: {:?}", chats);
-    let date_time: NaiveDateTime = NaiveDate::from_ymd(2020, 10, 26).and_hms(9, 15, 52);
-    let mut cursor = Box::pin(TgClient::get_chat_history_stream(
-        main_api.clone(),
-        chats.chat_ids()[0],
-        date_time.timestamp(),
-    ));
+
     let all_chats = main_api.read().await.get_all_channels(10).await;
     println!("{:?}", all_chats);
     //

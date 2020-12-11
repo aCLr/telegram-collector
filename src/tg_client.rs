@@ -1,9 +1,11 @@
+use async_trait::async_trait;
 use rtdlib::types::{
-    Chat, ChatType, Chats, CheckAuthenticationCode, Close, GetChat, GetChatHistory, GetChats,
-    GetSupergroup, GetSupergroupFullInfo, JoinChat, Message, Messages, Ok, SearchPublicChats,
-    SetAuthenticationPhoneNumber, SetDatabaseEncryptionKey, SetTdlibParameters, TdlibParameters,
-    UpdateAuthorizationState, UpdateChatPhoto, UpdateChatTitle, UpdateMessageContent,
-    UpdateNewMessage, UpdateSupergroup, UpdateSupergroupFullInfo, GetMessageLink
+    Chat, ChatType, Chats, CheckAuthenticationCode, Close, DownloadFile, File, GetChat,
+    GetChatHistory, GetChats, GetMessageLink, GetSupergroup, GetSupergroupFullInfo, HttpUrl,
+    JoinChat, Message, Messages, Ok, SearchPublicChats, SetAuthenticationPhoneNumber,
+    SetDatabaseEncryptionKey, SetTdlibParameters, Supergroup, SupergroupFullInfo, TdlibParameters,
+    UpdateAuthorizationState, UpdateChatPhoto, UpdateChatTitle, UpdateFile, UpdateMessageContent,
+    UpdateNewMessage,
 };
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
@@ -14,33 +16,104 @@ use telegram_client::client::Client;
 
 use crate::config::Config;
 use crate::result::Result;
+use crate::traits;
 use crate::types;
-use crate::types::Channel;
 use futures::future::join_all;
 use futures::{Stream, StreamExt, TryStreamExt};
+use rtdlib::errors::RTDResult;
+use std::collections::VecDeque;
 use telegram_client::api::aevent::EventApi;
 use telegram_client::errors::TGResult;
+use telegram_client::listener::Listener;
 use tokio::runtime;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
 
+impl traits::TelegramClientTrait for Client {
+    fn listener(&mut self) -> &mut Listener {
+        self.listener()
+    }
+
+    fn start(&self) -> JoinHandle<()> {
+        self.start()
+    }
+}
+
+#[async_trait]
+impl traits::TelegramAsyncApi for AsyncApi {
+    async fn download_file(&self, download_file: DownloadFile) -> RTDResult<File> {
+        self.download_file(download_file).await
+    }
+
+    async fn close(&self, close: Close) -> RTDResult<Ok> {
+        self.close(close).await
+    }
+
+    async fn get_chat(&self, get_chat: GetChat) -> RTDResult<Chat> {
+        self.get_chat(get_chat).await
+    }
+
+    async fn get_chats(&self, get_chats: GetChats) -> RTDResult<Chats> {
+        self.get_chats(get_chats).await
+    }
+
+    async fn get_chat_history(&self, get_chat_history: GetChatHistory) -> RTDResult<Messages> {
+        self.get_chat_history(get_chat_history).await
+    }
+
+    async fn get_message_link(&self, get_message_link: GetMessageLink) -> RTDResult<HttpUrl> {
+        self.get_message_link(get_message_link).await
+    }
+
+    async fn search_public_chats(
+        &self,
+        search_public_chats: SearchPublicChats,
+    ) -> RTDResult<Chats> {
+        self.search_public_chats(search_public_chats).await
+    }
+
+    async fn join_chat(&self, join_chat: JoinChat) -> RTDResult<Ok> {
+        self.join_chat(join_chat).await
+    }
+
+    async fn get_supergroup_full_info(
+        &self,
+        get_supergroup_full_info: GetSupergroupFullInfo,
+    ) -> RTDResult<SupergroupFullInfo> {
+        self.get_supergroup_full_info(get_supergroup_full_info)
+            .await
+    }
+
+    async fn get_supergroup(&self, get_supergroup: GetSupergroup) -> RTDResult<Supergroup> {
+        self.get_supergroup(get_supergroup).await
+    }
+}
+
 #[derive(Clone)]
 pub struct TgClient {
-    client: Client,
-    api: AsyncApi,
+    client: Box<dyn traits::TelegramClientTrait>,
+    api: Box<dyn traits::TelegramAsyncApi>,
     have_authorization: Arc<(Mutex<bool>, Condvar)>,
+    max_download_queue_size: usize,
+
+    // TODO: move to separated structure with WAL-like and debug\state request mechanism
+    download_queue: Arc<Mutex<VecDeque<i64>>>,
+    download_in_progress: Arc<Mutex<Vec<i64>>>,
 }
 
 impl TgClient {
     pub fn new(config: &Config) -> Self {
         Client::set_log_verbosity_level(config.log_verbosity_level)
             .expect("can't change tdlib loglevel");
-        let api = Api::rasync();
-        let mut client = Client::new(api.api().clone());
+        let api = Box::new(Api::rasync());
+        let mut client = Box::new(Client::new(api.api().clone()));
         client.warn_unregister_listener(false);
         let mut tg = TgClient {
             client,
-            api: api,
+            api,
             have_authorization: Arc::new((Mutex::new(false), Condvar::new())),
+            download_in_progress: Arc::new(Mutex::new(Vec::new())),
+            download_queue: Arc::new(Mutex::new(VecDeque::new())),
+            max_download_queue_size: config.max_download_queue_size,
         };
         tg.auth(config);
         tg
@@ -62,9 +135,11 @@ impl TgClient {
         listener.on_update_message_content(get_update_content_handler(channel.clone()));
         listener.on_update_chat_photo(get_update_chat_photo_handler(channel.clone()));
         listener.on_update_chat_title(get_update_chat_title_handler(channel.clone()));
-        listener.on_update_supergroup(get_update_supergroup_handler(channel.clone()));
-        listener.on_update_supergroup_full_info(get_update_supergroup_full_info_handler(
+
+        listener.on_update_file(get_update_file_handler(
             channel.clone(),
+            self.download_queue.clone(),
+            self.download_in_progress.clone(),
         ));
     }
 
@@ -98,6 +173,33 @@ impl TgClient {
             .api
             .join_chat(JoinChat::builder().chat_id(*chat_id).build())
             .await?)
+    }
+
+    fn make_download_file_request(file_id: i64) -> DownloadFile {
+        DownloadFile::builder()
+            .file_id(file_id)
+            .synchronous(false)
+            .priority(1)
+            .build()
+    }
+
+    pub async fn download_file(&mut self, file_id: i64) -> Result<()> {
+        {
+            let mut progress = self.download_in_progress.lock().unwrap();
+            if progress.len() >= self.max_download_queue_size {
+                self.download_queue.lock().unwrap().push_back(file_id);
+                debug!("file {} download delayed", file_id);
+                ()
+            } else {
+                debug!("file {} download started", file_id);
+                progress.push(file_id)
+            }
+        }
+
+        self.api
+            .download_file(TgClient::make_download_file_request(file_id))
+            .await?;
+        Ok(())
     }
 
     pub async fn get_channel(&self, chat_id: i64) -> Result<Option<types::Channel>> {
@@ -175,7 +277,17 @@ impl TgClient {
     }
 
     pub async fn get_message_link(&self, chat_id: i64, message_id: i64) -> Result<String> {
-        Ok(self.api.get_message_link(GetMessageLink::builder().chat_id(chat_id).message_id(message_id).build()).await?.url().clone())
+        Ok(self
+            .api
+            .get_message_link(
+                GetMessageLink::builder()
+                    .chat_id(chat_id)
+                    .message_id(message_id)
+                    .build(),
+            )
+            .await?
+            .url()
+            .clone())
     }
 
     pub fn get_chat_history_stream(
@@ -302,6 +414,7 @@ macro_rules! get_handler_func {
             channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
         ) -> impl Fn((&EventApi, &$orig_update_name)) -> TGResult<()> + 'static {
             move |(_, update)| {
+                // TODO tokio::spawn
                 let mut rt = runtime::Runtime::new().unwrap();
                 rt.block_on(async {
                     let mut local = channel.lock().await;
@@ -324,19 +437,342 @@ get_handler_func!(
 );
 get_handler_func!(get_update_chat_photo_handler, UpdateChatPhoto, ChatPhoto);
 get_handler_func!(get_update_chat_title_handler, UpdateChatTitle, ChatTitle);
-get_handler_func!(get_update_supergroup_handler, UpdateSupergroup, Supergroup);
-get_handler_func!(
-    get_update_supergroup_full_info_handler,
-    UpdateSupergroupFullInfo,
-    SupergroupFullInfo
-);
+
+fn get_update_file_handler(
+    channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
+    download_queue: Arc<Mutex<VecDeque<i64>>>,
+    download_in_progress: Arc<Mutex<Vec<i64>>>,
+) -> impl Fn((&EventApi, &UpdateFile)) -> TGResult<()> + 'static {
+    move |(api, update)| {
+        if update.file().local().is_downloading_completed() {
+            if !download_in_progress
+                .lock()
+                .unwrap()
+                .contains(&update.file().id())
+            {
+                return Ok(());
+            }
+
+            download_in_progress
+                .lock()
+                .unwrap()
+                .retain(|x| x != &update.file().id());
+
+            if let Some(file_id) = download_queue.lock().unwrap().pop_front() {
+                debug!("new file from queue: {}", file_id);
+                download_in_progress.lock().unwrap().push(file_id);
+                if let Err(e) = api.download_file(TgClient::make_download_file_request(file_id)) {
+                    error!("{}", e);
+                    debug!("file {} downloading started", file_id);
+                }
+            }
+            let mut rt = runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let mut local = channel.lock().await;
+                match local.send(TgUpdate::FileDownloaded(update.clone())).await {
+                    Err(err) => error!("{}", err),
+                    Ok(_) => {}
+                };
+            });
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub enum TgUpdate {
     NewMessage(UpdateNewMessage),
     MessageContent(UpdateMessageContent),
     ChatPhoto(UpdateChatPhoto),
+    FileDownloaded(UpdateFile),
     ChatTitle(UpdateChatTitle),
-    Supergroup(UpdateSupergroup),
-    SupergroupFullInfo(UpdateSupergroupFullInfo),
+    // looks like we do not need it: that updates may contain data, which does not make sense for project
+    // there is just a several improtant fields: description, username and invite_link
+    // Supergroup(UpdateSupergroup),
+    // SupergroupFullInfo(UpdateSupergroupFullInfo),
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Config;
+    use crate::tg_client::{get_update_file_handler, TgClient};
+    use crate::traits;
+    use async_trait::async_trait;
+    use rtdlib::errors::{RTDError, RTDResult};
+    use rtdlib::types::*;
+    use std::sync::{Arc, Condvar, Mutex};
+    use telegram_client::api::aevent::EventApi;
+    use telegram_client::api::Api;
+    use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
+
+    #[derive(Clone)]
+    struct MockedApi;
+
+    #[async_trait]
+    impl traits::TelegramAsyncApi for MockedApi {
+        async fn download_file(&self, download_file: DownloadFile) -> RTDResult<File> {
+            Ok(File::builder().build())
+        }
+
+        async fn close(&self, close: Close) -> RTDResult<Ok> {
+            Ok(Ok::builder().build())
+        }
+
+        async fn get_chat(&self, get_chat: GetChat) -> RTDResult<Chat> {
+            Ok(Chat::builder().build())
+        }
+
+        async fn get_chats(&self, get_chats: GetChats) -> RTDResult<Chats> {
+            Ok(Chats::builder().build())
+        }
+
+        async fn get_chat_history(&self, get_chat_history: GetChatHistory) -> RTDResult<Messages> {
+            Ok(Messages::builder().build())
+        }
+
+        async fn get_message_link(&self, get_message_link: GetMessageLink) -> RTDResult<HttpUrl> {
+            Ok(HttpUrl::builder().build())
+        }
+
+        async fn search_public_chats(
+            &self,
+            search_public_chats: SearchPublicChats,
+        ) -> RTDResult<Chats> {
+            Ok(Chats::builder().build())
+        }
+
+        async fn join_chat(&self, join_chat: JoinChat) -> RTDResult<Ok> {
+            Ok(Ok::builder().build())
+        }
+
+        async fn get_supergroup_full_info(
+            &self,
+            get_supergroup_full_info: GetSupergroupFullInfo,
+        ) -> RTDResult<SupergroupFullInfo> {
+            Ok(SupergroupFullInfo::builder().build())
+        }
+
+        async fn get_supergroup(&self, get_supergroup: GetSupergroup) -> RTDResult<Supergroup> {
+            Ok(Supergroup::builder().build())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_file() {
+        let mut client = TgClient::new(&Config {
+            max_download_queue_size: 1,
+            log_verbosity_level: 0,
+            database_directory: "".to_string(),
+            api_id: 0,
+            api_hash: "".to_string(),
+            phone_number: "".to_string(),
+        });
+        client.api = Box::new(MockedApi);
+
+        client.download_file(1).await;
+        assert!(client.download_queue.lock().unwrap().is_empty());
+        assert_eq!(
+            client
+                .download_in_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1]
+        );
+
+        client.download_file(1).await;
+        assert_eq!(
+            client
+                .download_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1]
+        );
+        assert_eq!(
+            client
+                .download_in_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1]
+        );
+
+        client.download_file(2).await;
+        assert_eq!(
+            client
+                .download_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1, &2]
+        );
+        assert_eq!(
+            client
+                .download_in_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1]
+        );
+
+        let (sender, receiver) = mpsc::channel(1);
+        let chann = Arc::new(AsyncMutex::new(sender));
+        let download_finished_handler = get_update_file_handler(
+            chann,
+            client.download_queue.clone(),
+            client.download_in_progress.clone(),
+        );
+        let eapi = EventApi::new(Api::default());
+
+        download_finished_handler((
+            &eapi,
+            &UpdateFile::builder()
+                .file(
+                    File::builder()
+                        .local(LocalFile::builder().is_downloading_completed(false).build()),
+                )
+                .build(),
+        ));
+
+        // no changes
+        assert_eq!(
+            client
+                .download_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1, &2]
+        );
+        assert_eq!(
+            client
+                .download_in_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1]
+        );
+
+        download_finished_handler((
+            &eapi,
+            &UpdateFile::builder()
+                .file(
+                    File::builder()
+                        .id(10)
+                        .local(LocalFile::builder().is_downloading_completed(true).build()),
+                )
+                .build(),
+        ));
+
+        // no changes: file not in progress
+        assert_eq!(
+            client
+                .download_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1, &2]
+        );
+        assert_eq!(
+            client
+                .download_in_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1]
+        );
+
+        download_finished_handler((
+            &eapi,
+            &UpdateFile::builder()
+                .file(
+                    File::builder()
+                        .id(1)
+                        .local(LocalFile::builder().is_downloading_completed(true).build()),
+                )
+                .build(),
+        ));
+        assert_eq!(
+            client
+                .download_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&2]
+        );
+        assert_eq!(
+            client
+                .download_in_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&1]
+        );
+
+        download_finished_handler((
+            &eapi,
+            &UpdateFile::builder()
+                .file(
+                    File::builder()
+                        .id(1)
+                        .local(LocalFile::builder().is_downloading_completed(true).build()),
+                )
+                .build(),
+        ));
+        assert!(client.download_queue.lock().unwrap().is_empty());
+        assert_eq!(
+            client
+                .download_in_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&2]
+        );
+
+        client.download_file(3).await;
+        client.download_file(4).await;
+        client.download_file(5).await;
+
+        download_finished_handler((
+            &eapi,
+            &UpdateFile::builder()
+                .file(
+                    File::builder()
+                        .id(2)
+                        .local(LocalFile::builder().is_downloading_completed(true).build()),
+                )
+                .build(),
+        ));
+
+        assert_eq!(
+            client
+                .download_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&4, &5]
+        );
+        assert_eq!(
+            client
+                .download_in_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<Vec<&i64>>(),
+            vec![&3]
+        );
+    }
 }
