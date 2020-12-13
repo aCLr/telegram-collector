@@ -1,3 +1,4 @@
+#![allow(clippy::mutex_atomic)]
 use async_trait::async_trait;
 use rtdlib::types::{
     Chat, ChatType, Chats, CheckAuthenticationCode, Close, DownloadFile, File, GetChat,
@@ -22,6 +23,7 @@ use futures::future::join_all;
 use futures::{Stream, StreamExt, TryStreamExt};
 use rtdlib::errors::RTDResult;
 use std::collections::VecDeque;
+use std::time::Duration;
 use telegram_client::api::aevent::EventApi;
 use telegram_client::errors::TGResult;
 use telegram_client::listener::Listener;
@@ -88,16 +90,60 @@ impl traits::TelegramAsyncApi for AsyncApi {
     }
 }
 
+#[derive(Debug, Default)]
+struct DownloadQueue {
+    queue_size: usize,
+    queue: VecDeque<i64>,
+    in_progress: Vec<i64>,
+}
+
+impl DownloadQueue {
+    pub fn new(queue_size: usize) -> Self {
+        Self {
+            queue_size,
+            ..Default::default()
+        }
+    }
+
+    pub fn log_state(&self) {
+        debug!("download queue state: {:?}", self);
+    }
+
+    pub fn is_in_progress(&self, obj: &i64) -> bool {
+        self.in_progress.contains(&obj)
+    }
+
+    pub fn may_be_download(&mut self, obj: i64) -> bool {
+        self.log_state();
+        if self.in_progress.len() >= self.queue_size {
+            self.queue.push_back(obj);
+            false
+        } else {
+            self.in_progress.push(obj);
+            true
+        }
+    }
+
+    pub fn mark_as_done_and_get_new(&mut self, obj: &i64) -> Option<i64> {
+        self.log_state();
+        self.in_progress.retain(|x| x != obj);
+        let new = self.queue.pop_front();
+        match new {
+            Some(n) => {
+                self.in_progress.push(n);
+                Some(n)
+            }
+            None => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TgClient {
     client: Box<dyn traits::TelegramClientTrait>,
     api: Box<dyn traits::TelegramAsyncApi>,
     have_authorization: Arc<(Mutex<bool>, Condvar)>,
-    max_download_queue_size: usize,
-
-    // TODO: move to separated structure with WAL-like and debug\state request mechanism
-    download_queue: Arc<Mutex<VecDeque<i64>>>,
-    download_in_progress: Arc<Mutex<Vec<i64>>>,
+    download_queue: Arc<Mutex<DownloadQueue>>,
 }
 
 impl TgClient {
@@ -107,13 +153,25 @@ impl TgClient {
         let api = Box::new(Api::rasync());
         let mut client = Box::new(Client::new(api.api().clone()));
         client.warn_unregister_listener(false);
+        let download_queue = Arc::new(Mutex::new(DownloadQueue::new(
+            config.max_download_queue_size,
+        )));
+
+        if config.log_download_state_secs_interval != 0 {
+            let q_log = download_queue.clone();
+            let sleep = Duration::from_secs(config.log_download_state_secs_interval);
+            tokio::spawn(async move {
+                loop {
+                    q_log.lock().unwrap().log_state();
+                    tokio::time::delay_for(sleep).await;
+                }
+            });
+        }
         let mut tg = TgClient {
             client,
             api,
             have_authorization: Arc::new((Mutex::new(false), Condvar::new())),
-            download_in_progress: Arc::new(Mutex::new(Vec::new())),
-            download_queue: Arc::new(Mutex::new(VecDeque::new())),
-            max_download_queue_size: config.max_download_queue_size,
+            download_queue,
         };
         tg.auth(config);
         tg
@@ -137,9 +195,8 @@ impl TgClient {
         listener.on_update_chat_title(get_update_chat_title_handler(channel.clone()));
 
         listener.on_update_file(get_update_file_handler(
-            channel.clone(),
+            channel,
             self.download_queue.clone(),
-            self.download_in_progress.clone(),
         ));
     }
 
@@ -175,30 +232,16 @@ impl TgClient {
             .await?)
     }
 
-    fn make_download_file_request(file_id: i64) -> DownloadFile {
-        DownloadFile::builder()
-            .file_id(file_id)
-            .synchronous(false)
-            .priority(1)
-            .build()
-    }
-
     pub async fn download_file(&mut self, file_id: i64) -> Result<()> {
-        {
-            let mut progress = self.download_in_progress.lock().unwrap();
-            if progress.len() >= self.max_download_queue_size {
-                self.download_queue.lock().unwrap().push_back(file_id);
-                debug!("file {} download delayed", file_id);
-                ()
-            } else {
-                debug!("file {} download started", file_id);
-                progress.push(file_id)
-            }
+        let may_be_download = {
+            let mut queue = self.download_queue.lock().unwrap();
+            queue.may_be_download(file_id)
+        };
+        if may_be_download {
+            self.api
+                .download_file(make_download_file_request(file_id))
+                .await?;
         }
-
-        self.api
-            .download_file(TgClient::make_download_file_request(file_id))
-            .await?;
         Ok(())
     }
 
@@ -232,12 +275,11 @@ impl TgClient {
     }
 
     async fn convert_chats_to_channels(&self, chats: Chats) -> Result<Vec<types::Channel>> {
-        let channels = join_all(chats.chat_ids().into_iter().map(|&c| self.get_channel(c))).await;
+        let channels = join_all(chats.chat_ids().iter().map(|&c| self.get_channel(c))).await;
         let mut result = vec![];
         for channel in channels {
-            match channel? {
-                Some(ch) => result.push(ch),
-                None => {}
+            if let Some(ch) = channel? {
+                result.push(ch)
             }
         }
         Ok(result)
@@ -326,7 +368,7 @@ impl TgClient {
                 };
                 match result_messages {
                     Ok(messages) => {
-                        if messages.len() > 0 {
+                        if !messages.is_empty() {
                             Some((Ok(messages), (from_message_id, client)))
                         } else {
                             None
@@ -336,13 +378,21 @@ impl TgClient {
                 }
             },
         )
-        .map_ok(|updates| futures::stream::iter(updates.clone()).map(Ok))
+        .map_ok(|updates| futures::stream::iter(updates).map(Ok))
         .try_flatten()
     }
 
     pub async fn close(&mut self) {
         self.api.close(Close::builder().build()).await.unwrap();
     }
+}
+
+fn make_download_file_request(file_id: i64) -> DownloadFile {
+    DownloadFile::builder()
+        .file_id(file_id)
+        .synchronous(false)
+        .priority(1)
+        .build()
 }
 
 fn type_in() -> String {
@@ -357,7 +407,6 @@ fn get_auth_state_handler(
     config: &Config,
     have_auth: Arc<(Mutex<bool>, Condvar)>,
 ) -> impl Fn((&EventApi, &UpdateAuthorizationState)) -> TGResult<()> + 'static {
-    let have_auth = have_auth.clone();
     let td_params = SetTdlibParameters::builder()
         .parameters(
             TdlibParameters::builder()
@@ -440,38 +489,27 @@ get_handler_func!(get_update_chat_title_handler, UpdateChatTitle, ChatTitle);
 
 fn get_update_file_handler(
     channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-    download_queue: Arc<Mutex<VecDeque<i64>>>,
-    download_in_progress: Arc<Mutex<Vec<i64>>>,
+    download_queue: Arc<Mutex<DownloadQueue>>,
 ) -> impl Fn((&EventApi, &UpdateFile)) -> TGResult<()> + 'static {
     move |(api, update)| {
         if update.file().local().is_downloading_completed() {
-            if !download_in_progress
-                .lock()
-                .unwrap()
-                .contains(&update.file().id())
-            {
+            trace!("file {} downloading finished", update.file().id());
+            let mut download_queue = download_queue.lock().unwrap();
+            if !download_queue.is_in_progress(&update.file().id()) {
                 return Ok(());
             }
 
-            download_in_progress
-                .lock()
-                .unwrap()
-                .retain(|x| x != &update.file().id());
-
-            if let Some(file_id) = download_queue.lock().unwrap().pop_front() {
-                debug!("new file from queue: {}", file_id);
-                download_in_progress.lock().unwrap().push(file_id);
-                if let Err(e) = api.download_file(TgClient::make_download_file_request(file_id)) {
+            if let Some(file_id) = download_queue.mark_as_done_and_get_new(&update.file().id()) {
+                trace!("file {} downloading started", file_id);
+                if let Err(e) = api.download_file(make_download_file_request(file_id)) {
                     error!("{}", e);
-                    debug!("file {} downloading started", file_id);
                 }
             }
             let mut rt = runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let mut local = channel.lock().await;
-                match local.send(TgUpdate::FileDownloaded(update.clone())).await {
-                    Err(err) => error!("{}", err),
-                    Ok(_) => {}
+                if let Err(err) = local.send(TgUpdate::FileDownloaded(update.clone())).await {
+                    error!("{}", err);
                 };
             });
         }
@@ -570,64 +608,30 @@ mod tests {
         client.api = Box::new(MockedApi);
 
         client.download_file(1).await;
-        assert!(client.download_queue.lock().unwrap().is_empty());
+        assert_eq!(client.download_queue.lock().unwrap().queue().len(), 0);
         assert_eq!(
-            client
-                .download_in_progress
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1]
+            client.download_queue.lock().unwrap().in_progress(),
+            &vec![1]
         );
 
         client.download_file(1).await;
+        assert_eq!(client.download_queue.lock().unwrap().queue(), &vec![1]);
         assert_eq!(
-            client
-                .download_queue
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1]
-        );
-        assert_eq!(
-            client
-                .download_in_progress
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1]
+            client.download_queue.lock().unwrap().in_progress(),
+            &vec![1]
         );
 
         client.download_file(2).await;
+        assert_eq!(client.download_queue.lock().unwrap().queue(), &vec![1, 2]);
         assert_eq!(
-            client
-                .download_queue
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1, &2]
-        );
-        assert_eq!(
-            client
-                .download_in_progress
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1]
+            client.download_queue.lock().unwrap().in_progress(),
+            &vec![1]
         );
 
         let (sender, receiver) = mpsc::channel(1);
         let chann = Arc::new(AsyncMutex::new(sender));
-        let download_finished_handler = get_update_file_handler(
-            chann,
-            client.download_queue.clone(),
-            client.download_in_progress.clone(),
-        );
+        let download_finished_handler =
+            get_update_file_handler(chann, client.download_queue.clone());
         let eapi = EventApi::new(Api::default());
 
         download_finished_handler((
@@ -641,23 +645,10 @@ mod tests {
         ));
 
         // no changes
+        assert_eq!(client.download_queue.lock().unwrap().queue(), &vec![1, 2]);
         assert_eq!(
-            client
-                .download_queue
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1, &2]
-        );
-        assert_eq!(
-            client
-                .download_in_progress
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1]
+            client.download_queue.lock().unwrap().in_progress(),
+            &vec![1]
         );
 
         download_finished_handler((
@@ -672,23 +663,10 @@ mod tests {
         ));
 
         // no changes: file not in progress
+        assert_eq!(client.download_queue.lock().unwrap().queue(), &vec![1, 2]);
         assert_eq!(
-            client
-                .download_queue
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1, &2]
-        );
-        assert_eq!(
-            client
-                .download_in_progress
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1]
+            client.download_queue.lock().unwrap().in_progress(),
+            &vec![1]
         );
 
         download_finished_handler((
@@ -701,23 +679,10 @@ mod tests {
                 )
                 .build(),
         ));
+        assert_eq!(client.download_queue.lock().unwrap().queue(), &vec![2]);
         assert_eq!(
-            client
-                .download_queue
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&2]
-        );
-        assert_eq!(
-            client
-                .download_in_progress
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&1]
+            client.download_queue.lock().unwrap().in_progress(),
+            &vec![1]
         );
 
         download_finished_handler((
@@ -730,15 +695,10 @@ mod tests {
                 )
                 .build(),
         ));
-        assert!(client.download_queue.lock().unwrap().is_empty());
+        assert_eq!(client.download_queue.lock().unwrap().queue().len(), 0);
         assert_eq!(
-            client
-                .download_in_progress
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&2]
+            client.download_queue.lock().unwrap().in_progress(),
+            &vec![2]
         );
 
         client.download_file(3).await;
@@ -756,23 +716,10 @@ mod tests {
                 .build(),
         ));
 
+        assert_eq!(client.download_queue.lock().unwrap().queue(), &vec![4, 5]);
         assert_eq!(
-            client
-                .download_queue
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&4, &5]
-        );
-        assert_eq!(
-            client
-                .download_in_progress
-                .lock()
-                .unwrap()
-                .iter()
-                .collect::<Vec<&i64>>(),
-            vec![&3]
+            client.download_queue.lock().unwrap().in_progress(),
+            &vec![3]
         );
     }
 }
