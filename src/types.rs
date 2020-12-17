@@ -1,5 +1,6 @@
 use rtdlib::types::{
-    Animation, Chat, File, PhotoSize, Poll, PollOption, Sticker, Supergroup, SupergroupFullInfo,
+    Animation, Audio, Chat, File, PhotoSize, Poll, PollOption, Sticker, Supergroup,
+    SupergroupFullInfo, Video, VideoNote,
 };
 use serde::Serialize;
 
@@ -84,6 +85,49 @@ impl From<&Animation> for AnimationMeta {
 }
 
 #[derive(Debug, Serialize)]
+pub struct VideoMeta {
+    pub duration: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+impl From<&Video> for VideoMeta {
+    fn from(video: &Video) -> Self {
+        Self {
+            duration: video.duration(),
+            width: video.width(),
+            height: video.height(),
+        }
+    }
+}
+
+impl From<&VideoNote> for VideoMeta {
+    fn from(video: &VideoNote) -> Self {
+        Self {
+            duration: video.duration(),
+            width: video.length(),
+            height: video.length(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AudioMeta {
+    pub duration: i64,
+    pub title: String,
+    pub performer: String,
+}
+
+impl From<&Audio> for AudioMeta {
+    fn from(audio: &Audio) -> Self {
+        Self {
+            duration: audio.duration(),
+            title: audio.title().clone(),
+            performer: audio.performer().clone(),
+        }
+    }
+}
+#[derive(Debug, Serialize)]
 pub struct PollMeta {
     pub question: String,
     pub options: Vec<PollOptionMeta>,
@@ -120,6 +164,8 @@ impl From<&PollOption> for PollOptionMeta {
 #[derive(Debug)]
 pub enum FileType {
     Document,
+    Audio(AudioMeta),
+    Video(VideoMeta),
     Animation(AnimationMeta),
     Image(ImageMeta),
 }

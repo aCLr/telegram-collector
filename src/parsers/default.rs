@@ -13,6 +13,12 @@ impl DefaultTelegramParser {
     }
 }
 
+impl Default for DefaultTelegramParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl TelegramDataParser for DefaultTelegramParser {
     async fn parse_update(&self, tg_update: &TgUpdate) -> Result<Option<TelegramUpdate>> {
@@ -85,8 +91,16 @@ impl TelegramDataParser for DefaultTelegramParser {
                     Some(vec![file]),
                 ))
             }
-            MessageContent::MessageAudio(audio) => {
-                Ok((Some(self.parse_formatted_text(audio.caption())), None))
+            MessageContent::MessageAudio(message_audio) => {
+                let file = TelegramFileWithMeta {
+                    path: message_audio.audio().audio().into(),
+                    file_type: FileType::Audio(message_audio.audio().into()),
+                    file_name: Some(message_audio.audio().file_name().clone()),
+                };
+                Ok((
+                    Some(self.parse_formatted_text(message_audio.caption())),
+                    Some(vec![file]),
+                ))
             }
             MessageContent::MessageDocument(message_document) => {
                 let file = TelegramFileWithMeta {
@@ -115,8 +129,16 @@ impl TelegramDataParser for DefaultTelegramParser {
                     Some(files),
                 ))
             }
-            MessageContent::MessageVideo(video) => {
-                Ok((Some(self.parse_formatted_text(video.caption())), None))
+            MessageContent::MessageVideo(message_video) => {
+                let file = TelegramFileWithMeta {
+                    path: message_video.video().video().into(),
+                    file_type: FileType::Video(message_video.video().into()),
+                    file_name: Some(message_video.video().file_name().clone()),
+                };
+                Ok((
+                    Some(self.parse_formatted_text(message_video.caption())),
+                    Some(vec![file]),
+                ))
             }
 
             MessageContent::MessageChatChangePhoto(u) => {
@@ -184,8 +206,13 @@ impl TelegramDataParser for DefaultTelegramParser {
                 Err(Error::UpdateNotSupported(u.td_name().to_string()))
             }
 
-            MessageContent::MessageVideoNote(u) => {
-                Err(Error::UpdateNotSupported(u.td_name().to_string()))
+            MessageContent::MessageVideoNote(message_video_note) => {
+                let file = TelegramFileWithMeta {
+                    path: message_video_note.video_note().video().into(),
+                    file_type: FileType::Video(message_video_note.video_note().into()),
+                    file_name: None,
+                };
+                Ok((None, Some(vec![file])))
             }
             MessageContent::MessageVoiceNote(u) => {
                 Err(Error::UpdateNotSupported(u.td_name().to_string()))
