@@ -8,15 +8,21 @@ edition = "2018"
 
 [dependencies]
 tokio = {version = "0.2.22", features = ["full"]}
+
 #rtdlib = { git = "https://github.com/aCLr/rtdlib.git", branch = "async-client", features = [ "sys" ] }
 rtdlib = { path = "../../rtdlib", features = [ "sys" ] }
 #telegram-client = { git = "https://github.com/aCLr/telegram-client.git", branch = "telegram-client/issues/15" }
 telegram-client = { path = "../../telegram-client"}
+
 futures = "0.3.7"
 futures-util = "0.3.7"
+
 log = "0.4"
+
 async-trait = "0.1.42"
 dyn-clone = "1.0.3"
+
+serde = {version = "1.0", features = ["derive"]}
 
 [dev-dependencies]
 simple_logger = "1.3"
