@@ -13,46 +13,38 @@ use tokio::task::spawn;
 async fn main() {
     simple_logger::init().unwrap();
     log::set_max_level("INFO".parse().unwrap());
-    let conf = Config {
-        max_download_queue_size: 1,
-        log_verbosity_level: 0,
-        database_directory: "tdlib".to_string(),
-        api_id: env!("API_ID").parse().unwrap(),
-        api_hash: env!("API_HASH").to_string(),
-        phone_number: env!("TG_PHONE").to_string(),
-    };
-    let main_api = Arc::new(RwLock::new(TgClient::new(&conf)));
     let (sender, receiver) = mpsc::channel::<TgUpdate>(2000);
-    let mut join_handle = None;
-    let chats = {
-        println!("lock");
-        let mut guard = main_api.write().await;
-        println!("locked");
-        println!("start listen");
-        guard.start_listen_updates(sender);
-        println!("start");
-        join_handle.replace(Some(guard.start()));
-        println!("search");
-        let s = guard.search_public_chats("profunctor").await;
-        println!("{:?}", s);
-        s.unwrap()
-    };
+    let mut client = TgClient::builder()
+        .with_api_hash(env!("API_HASH").to_string())
+        .with_api_id(env!("API_ID").parse::<i64>().unwrap())
+        .with_phone_number(env!("TG_PHONE").to_string())
+        .with_updates_channel(sender)
+        .with_encryption_key(env!("ENCRYPTION_KEY").to_string())
+        .build()
+        .unwrap();
+    client.start().await;
+    let chats = client.search_public_chats("profunctor").await.unwrap();
     println!("chats: {:?}", chats);
 
-    let all_chats = main_api.read().await.get_all_channels(10).await;
+    let mut all_chats = client.get_all_channels(10).await.unwrap();
     println!("{:?}", all_chats);
-    //
-    // let receiver = Mutex::new(receiver);
-    // spawn(async move {
-    //     loop {
-    //         let update = receiver.lock().await.recv().await;
-    //         println!("{:?}", update);
-    //     }
-    // });
-    // while let Some(message) = cursor.next().await {
-    //     println!(
-    //         "{:?}",
-    //         NaiveDateTime::from_timestamp(message.unwrap().date(), 0)
-    //     );
-    // }
+
+    let receiver = Mutex::new(receiver);
+    spawn(async move {
+        loop {
+            let update = receiver.lock().await.recv().await;
+            println!("{:?}", update);
+        }
+    });
+    let mut history_cursor = Box::pin(TgClient::get_chat_history_stream(
+        Arc::new(RwLock::new(client)),
+        all_chats.pop().unwrap().chat_id,
+        NaiveDate::from_ymd(2021, 1, 1).and_hms(0, 0, 0).timestamp(),
+    ));
+    while let Some(message) = history_cursor.next().await {
+        println!(
+            "{:?}",
+            NaiveDateTime::from_timestamp(message.unwrap().date(), 0)
+        );
+    }
 }

@@ -1,17 +1,18 @@
+use crate::result::Result;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
-use rtdlib::errors::RTDResult;
-use rtdlib::types::{
+use rust_tdlib::client::client::ClientState;
+use rust_tdlib::errors::RTDResult;
+use rust_tdlib::types::{
     Chat, Chats, Close, DownloadFile, File, GetChat, GetChatHistory, GetChats, GetMessageLink,
     GetSupergroup, GetSupergroupFullInfo, HttpUrl, JoinChat, Messages, Ok, SearchPublicChats,
     Supergroup, SupergroupFullInfo,
 };
-use std::thread::JoinHandle;
-use telegram_client::listener::Listener;
+use tokio::task::JoinHandle;
 
+#[async_trait]
 pub trait TelegramClientTrait: DynClone + Send + Sync {
-    fn listener(&mut self) -> &mut Listener;
-    fn start(&self) -> JoinHandle<()>;
+    async fn start(&mut self) -> Result<JoinHandle<ClientState>>;
 }
 
 dyn_clone::clone_trait_object!(TelegramClientTrait);

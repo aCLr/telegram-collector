@@ -1,4 +1,4 @@
-use rtdlib::errors::RTDError;
+use rust_tdlib::errors::RTDError;
 use std::fmt;
 
 #[derive(Debug)]

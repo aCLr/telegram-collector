@@ -1,47 +1,105 @@
 #![allow(clippy::mutex_atomic)]
 use async_trait::async_trait;
-use rtdlib::types::{
-    Chat, ChatType, Chats, CheckAuthenticationCode, Close, DownloadFile, File, GetChat,
-    GetChatHistory, GetChats, GetMessageLink, GetSupergroup, GetSupergroupFullInfo, HttpUrl,
-    JoinChat, Message, Messages, Ok, SearchPublicChats, SetAuthenticationPhoneNumber,
-    SetDatabaseEncryptionKey, SetTdlibParameters, Supergroup, SupergroupFullInfo, TdlibParameters,
-    UpdateAuthorizationState, UpdateChatPhoto, UpdateChatTitle, UpdateFile, UpdateMessageContent,
-    UpdateNewMessage,
+use rust_tdlib::client::api::{Api, RawApi};
+use rust_tdlib::client::client::{Client, ClientState};
+use rust_tdlib::types::{
+    AuthorizationStateWaitCode, AuthorizationStateWaitEncryptionKey,
+    AuthorizationStateWaitOtherDeviceConfirmation, AuthorizationStateWaitPassword,
+    AuthorizationStateWaitPhoneNumber, AuthorizationStateWaitRegistration, Chat, ChatType, Chats,
+    Close, DownloadFile, File, GetChat, GetChatHistory, GetChats, GetMessageLink, GetSupergroup,
+    GetSupergroupFullInfo, HttpUrl, JoinChat, Message, Messages, Ok, SearchPublicChats, Supergroup,
+    SupergroupFullInfo, TdType, TdlibParameters, UpdateChatPhoto, UpdateChatTitle, UpdateFile,
+    UpdateMessageContent, UpdateNewMessage,
 };
 use std::io;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
-use telegram_client::api::aasync::AsyncApi;
-use telegram_client::api::Api;
-use telegram_client::client::Client;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::config::Config;
-use crate::result::Result;
+use crate::result::{Error, Result};
 use crate::traits;
 use crate::types;
 use futures::future::join_all;
 use futures::{Stream, StreamExt, TryStreamExt};
-use rtdlib::errors::RTDResult;
+use rust_tdlib::client::{AuthStateHandler, ClientBuilder, Tdlib};
+use rust_tdlib::errors::RTDResult;
 use std::collections::VecDeque;
 use std::time::Duration;
-use telegram_client::api::aevent::EventApi;
-use telegram_client::errors::TGResult;
-use telegram_client::listener::Listener;
-use tokio::runtime;
-use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
 
-impl traits::TelegramClientTrait for Client {
-    fn listener(&mut self) -> &mut Listener {
-        self.listener()
+#[derive(Clone, Debug)]
+struct AuthHandler {
+    encryption_key: String,
+    phone_number: String,
+}
+
+impl AuthHandler {
+    pub fn new(encryption_key: &str, phone_number: &str) -> Self {
+        Self {
+            encryption_key: encryption_key.to_string(),
+            phone_number: phone_number.to_string(),
+        }
     }
 
-    fn start(&self) -> JoinHandle<()> {
-        self.start()
+    fn wait_input() -> String {
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(_) => input.trim().to_string(),
+            Err(e) => panic!("Can not get input value: {:?}", e),
+        }
     }
 }
 
 #[async_trait]
-impl traits::TelegramAsyncApi for AsyncApi {
+impl AuthStateHandler for AuthHandler {
+    async fn handle_other_device_confirmation(
+        &self,
+        wait_device_confirmation: &AuthorizationStateWaitOtherDeviceConfirmation,
+    ) {
+        panic!("other device confirmation not supported")
+    }
+
+    async fn handle_wait_code(&self, wait_code: &AuthorizationStateWaitCode) -> String {
+        eprintln!("wait for auth code");
+        AuthHandler::wait_input()
+    }
+
+    async fn handle_encryption_key(
+        &self,
+        wait_encryption_key: &AuthorizationStateWaitEncryptionKey,
+    ) -> String {
+        self.encryption_key.to_string()
+    }
+
+    async fn handle_wait_password(&self, wait_password: &AuthorizationStateWaitPassword) -> String {
+        panic!("password not supported")
+    }
+
+    async fn handle_wait_phone_number(
+        &self,
+        wait_phone_number: &AuthorizationStateWaitPhoneNumber,
+    ) -> String {
+        self.phone_number.to_string()
+    }
+
+    async fn handle_wait_registration(
+        &self,
+        wait_registration: &AuthorizationStateWaitRegistration,
+    ) -> (String, String) {
+        panic!("registration not supported")
+    }
+}
+
+#[async_trait]
+impl traits::TelegramClientTrait for Client<AuthHandler, RawApi> {
+    async fn start(&mut self) -> Result<JoinHandle<ClientState>> {
+        Ok(self.start().await?)
+    }
+}
+
+#[async_trait]
+impl traits::TelegramAsyncApi for Api<RawApi> {
     async fn download_file(&self, download_file: DownloadFile) -> RTDResult<File> {
         self.download_file(download_file).await
     }
@@ -138,21 +196,159 @@ impl DownloadQueue {
     }
 }
 
+struct TdReceiver(mpsc::Receiver<TdType>);
+
+impl TdReceiver {
+    pub fn get_raw(self) -> mpsc::Receiver<TdType> {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+pub struct TgClientBuilder {
+    max_download_queue_size: usize,
+    log_download_state_secs_interval: u64,
+    log_verbosity_level: i32,
+    encryption_key: Option<String>,
+    database_directory: String,
+    api_id: Option<i64>,
+    api_hash: Option<String>,
+    phone_number: Option<String>,
+    updates_channel: Option<mpsc::Sender<TgUpdate>>,
+}
+
+impl TgClientBuilder {
+    pub fn new() -> Self {
+        Self {
+            max_download_queue_size: 1,
+            log_download_state_secs_interval: 10,
+            log_verbosity_level: 0,
+            encryption_key: None,
+            database_directory: "tdlib".to_string(),
+            api_id: None,
+            api_hash: None,
+            phone_number: None,
+            updates_channel: None,
+        }
+    }
+
+    pub fn with_updates_channel(mut self, channel: mpsc::Sender<TgUpdate>) -> Self {
+        self.updates_channel = Some(channel);
+        self
+    }
+
+    pub fn with_max_download_queue_size(mut self, max_download_queue_size: usize) -> Self {
+        self.max_download_queue_size = max_download_queue_size;
+        self
+    }
+    pub fn with_log_download_state_secs_interval(
+        mut self,
+        log_download_state_secs_interval: u64,
+    ) -> Self {
+        self.log_download_state_secs_interval = log_download_state_secs_interval;
+        self
+    }
+    pub fn with_log_verbosity_level(mut self, log_verbosity_level: i32) -> Self {
+        self.log_verbosity_level = log_verbosity_level;
+        self
+    }
+    pub fn with_encryption_key(mut self, encryption_key: String) -> Self {
+        self.encryption_key = Some(encryption_key);
+        self
+    }
+    pub fn with_database_directory(mut self, database_directory: String) -> Self {
+        self.database_directory = database_directory;
+        self
+    }
+    pub fn with_api_id(mut self, api_id: i64) -> Self {
+        self.api_id = Some(api_id);
+        self
+    }
+    pub fn with_api_hash(mut self, api_hash: String) -> Self {
+        self.api_hash = Some(api_hash);
+        self
+    }
+    pub fn with_phone_number(mut self, phone_number: String) -> Self {
+        self.phone_number = Some(phone_number);
+        self
+    }
+
+    pub fn build(self) -> Result<TgClient> {
+        let encryption_key = match self.encryption_key {
+            None => return Err(Error::Common("encryption_key not set".to_string())),
+            Some(e) => e,
+        };
+
+        let phone_number = match self.phone_number {
+            None => return Err(Error::Common("phone_number not set".to_string())),
+            Some(p) => p,
+        };
+
+        let api_hash = match self.api_hash {
+            None => return Err(Error::Common("api_hash not set".to_string())),
+            Some(a) => a,
+        };
+
+        let api_id = match self.api_id {
+            None => return Err(Error::Common("api_id not set".to_string())),
+            Some(a) => a,
+        };
+
+        let updates_channel = match self.updates_channel {
+            None => return Err(Error::Common("updates_channel not set".to_string())),
+            Some(u) => u,
+        };
+        let (s, r) = mpsc::channel::<TdType>(100);
+        let cfg = Config {
+            api_id,
+            updates_sender: &s,
+            max_download_queue_size: self.max_download_queue_size,
+            log_download_state_secs_interval: self.log_download_state_secs_interval,
+            log_verbosity_level: self.log_verbosity_level,
+            encryption_key: encryption_key.as_str(),
+            database_directory: self.database_directory.as_str(),
+            api_hash: api_hash.as_str(),
+            phone_number: phone_number.as_str(),
+        };
+        let cl = TgClient::new(&cfg);
+        cl.start_listen_updates(updates_channel, r)?;
+        Ok(cl)
+    }
+}
+
 #[derive(Clone)]
 pub struct TgClient {
     client: Box<dyn traits::TelegramClientTrait>,
     api: Box<dyn traits::TelegramAsyncApi>,
-    have_authorization: Arc<(Mutex<bool>, Condvar)>,
     download_queue: Arc<Mutex<DownloadQueue>>,
 }
 
 impl TgClient {
-    pub fn new(config: &Config) -> Self {
-        Client::set_log_verbosity_level(config.log_verbosity_level)
-            .expect("can't change tdlib loglevel");
-        let api = Box::new(Api::rasync());
-        let mut client = Box::new(Client::new(api.api().clone()));
-        client.warn_unregister_listener(false);
+    pub fn builder() -> TgClientBuilder {
+        TgClientBuilder::new()
+    }
+
+    pub(self) fn new(config: &Config) -> Self {
+        Tdlib::set_log_verbosity_level(config.log_verbosity_level);
+        let tdlib_parameters = TdlibParameters::builder()
+            .database_directory(&config.database_directory)
+            .use_test_dc(false)
+            .api_id(config.api_id)
+            .api_hash(&config.api_hash)
+            .system_language_code("en")
+            .device_model("Desktop")
+            .system_version("Unknown")
+            .application_version(env!("CARGO_PKG_VERSION"))
+            .enable_storage_optimizer(true)
+            .build();
+
+        let mut client = ClientBuilder::default()
+            .with_auth_state_handler(AuthHandler::new(config.encryption_key, config.phone_number))
+            .with_updates_sender(config.updates_sender.clone())
+            .with_tdlib_parameters(tdlib_parameters)
+            .build()
+            .unwrap();
+        let api = Box::new(client.api().clone());
         let download_queue = Arc::new(Mutex::new(DownloadQueue::new(
             config.max_download_queue_size,
         )));
@@ -168,46 +364,86 @@ impl TgClient {
             });
         }
         let mut tg = TgClient {
-            client,
+            client: Box::new(client),
             api,
-            have_authorization: Arc::new((Mutex::new(false), Condvar::new())),
             download_queue,
         };
-        tg.auth(config);
         tg
     }
 
-    fn auth(&mut self, config: &Config) {
-        let listener = self.client.listener();
+    pub(self) fn start_listen_updates(
+        &self,
+        channel: mpsc::Sender<TgUpdate>,
+        mut receiver: mpsc::Receiver<TdType>,
+    ) -> Result<()> {
+        let download_queue = self.download_queue.clone();
+        let mut channel = channel.clone();
+        let api = self.api.clone();
 
-        listener.on_update_authorization_state(get_auth_state_handler(
-            config,
-            self.have_authorization.clone(),
-        ));
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    TdType::UpdateNewMessage(new_message) => {
+                        if let Err(err) = channel.send(TgUpdate::NewMessage(new_message)).await {
+                            warn!("{}", err);
+                        };
+                    }
+                    TdType::UpdateMessageContent(message_content) => {
+                        if let Err(err) = channel
+                            .send(TgUpdate::MessageContent(message_content))
+                            .await
+                        {
+                            warn!("{}", err);
+                        };
+                    }
+                    TdType::UpdateChatPhoto(chat_photo) => {
+                        if let Err(err) = channel.send(TgUpdate::ChatPhoto(chat_photo)).await {
+                            warn!("{}", err)
+                        };
+                    }
+                    TdType::UpdateChatTitle(chat_title) => {
+                        if let Err(err) = channel.send(TgUpdate::ChatTitle(chat_title)).await {
+                            warn!("{}", err)
+                        };
+                    }
+                    TdType::UpdateFile(file) => {
+                        if file.file().local().is_downloading_completed() {
+                            trace!("file {} downloading finished", file.file().id());
+                            if !download_queue
+                                .lock()
+                                .unwrap()
+                                .is_in_progress(&file.file().id())
+                            {
+                                continue;
+                            }
+                            let file_id = match download_queue
+                                .lock()
+                                .unwrap()
+                                .mark_as_done_and_get_new(&file.file().id())
+                            {
+                                None => continue,
+                                Some(file_id) => file_id,
+                            };
+                            trace!("file {} downloading started", file_id);
+                            if let Err(e) =
+                                api.download_file(make_download_file_request(file_id)).await
+                            {
+                                error!("{}", e);
+                            }
+                            if let Err(err) = channel.send(TgUpdate::FileDownloaded(file)).await {
+                                error!("{}", err);
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok(())
     }
 
-    pub fn start_listen_updates(&mut self, channel: mpsc::Sender<TgUpdate>) {
-        let listener = self.client.listener();
-        let channel = Arc::new(AsyncMutex::new(channel));
-        listener.on_update_new_message(get_new_message_handler(channel.clone()));
-        listener.on_update_message_content(get_update_content_handler(channel.clone()));
-        listener.on_update_chat_photo(get_update_chat_photo_handler(channel.clone()));
-        listener.on_update_chat_title(get_update_chat_title_handler(channel.clone()));
-
-        listener.on_update_file(get_update_file_handler(
-            channel,
-            self.download_queue.clone(),
-        ));
-    }
-
-    pub fn start(&mut self) -> JoinHandle<()> {
-        let join_handle = self.client.start();
-        let (lock, cvar) = &*self.have_authorization;
-        let mut started = lock.lock().unwrap();
-        while !*started {
-            started = cvar.wait(started).unwrap();
-        }
-        join_handle
+    pub async fn start(&mut self) {
+        self.client.start().await;
     }
 
     pub async fn get_chat(&self, chat_id: &i64) -> Result<Chat> {
@@ -403,120 +639,6 @@ fn type_in() -> String {
     }
 }
 
-fn get_auth_state_handler(
-    config: &Config,
-    have_auth: Arc<(Mutex<bool>, Condvar)>,
-) -> impl Fn((&EventApi, &UpdateAuthorizationState)) -> TGResult<()> + 'static {
-    let td_params = SetTdlibParameters::builder()
-        .parameters(
-            TdlibParameters::builder()
-                .database_directory(&config.database_directory)
-                .use_test_dc(false)
-                .api_id(config.api_id)
-                .api_hash(&config.api_hash)
-                .system_language_code("en")
-                .device_model("Desktop")
-                .system_version("Unknown")
-                .application_version(env!("CARGO_PKG_VERSION"))
-                .enable_storage_optimizer(true)
-                .build(),
-        )
-        .build();
-    let phone_number = SetAuthenticationPhoneNumber::builder()
-        .phone_number(&config.phone_number)
-        .build();
-    move |(api, update)| {
-        let state = update.authorization_state();
-        state.on_wait_tdlib_parameters(|_| {
-            api.set_tdlib_parameters(&td_params).unwrap();
-            debug!("Set tdlib parameters");
-        });
-        state.on_wait_encryption_key(|_| {
-            let params = SetDatabaseEncryptionKey::builder().build();
-            api.set_database_encryption_key(&params).unwrap();
-            debug!("Set encryption key");
-        });
-        state.on_wait_phone_number(|_| {
-            api.set_authentication_phone_number(&phone_number).unwrap();
-            debug!("Set phone number");
-        });
-        state.on_wait_code(|_| {
-            println!("wait for auth code");
-            let code = type_in();
-            let code = CheckAuthenticationCode::builder().code(&code).build();
-            api.check_authentication_code(&code).unwrap();
-            debug!("Set auth code");
-        });
-        state.on_ready(|_| {
-            let (lock, cvar) = &*have_auth;
-            let mut authorized = lock.lock().unwrap();
-            *authorized = true;
-            cvar.notify_one();
-        });
-        Ok(())
-    }
-}
-
-macro_rules! get_handler_func {
-    ($fn: ident, $orig_update_name:ident, $tg_update_name:ident) => {
-        fn $fn(
-            channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-        ) -> impl Fn((&EventApi, &$orig_update_name)) -> TGResult<()> + 'static {
-            move |(_, update)| {
-                // TODO tokio::spawn
-                let mut rt = runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let mut local = channel.lock().await;
-                    match local.send(TgUpdate::$tg_update_name(update.clone())).await {
-                        Err(err) => warn!("{}", err),
-                        Ok(_) => {}
-                    };
-                });
-                Ok(())
-            }
-        }
-    };
-}
-
-get_handler_func!(get_new_message_handler, UpdateNewMessage, NewMessage);
-get_handler_func!(
-    get_update_content_handler,
-    UpdateMessageContent,
-    MessageContent
-);
-get_handler_func!(get_update_chat_photo_handler, UpdateChatPhoto, ChatPhoto);
-get_handler_func!(get_update_chat_title_handler, UpdateChatTitle, ChatTitle);
-
-fn get_update_file_handler(
-    channel: Arc<AsyncMutex<mpsc::Sender<TgUpdate>>>,
-    download_queue: Arc<Mutex<DownloadQueue>>,
-) -> impl Fn((&EventApi, &UpdateFile)) -> TGResult<()> + 'static {
-    move |(api, update)| {
-        if update.file().local().is_downloading_completed() {
-            trace!("file {} downloading finished", update.file().id());
-            let mut download_queue = download_queue.lock().unwrap();
-            if !download_queue.is_in_progress(&update.file().id()) {
-                return Ok(());
-            }
-
-            if let Some(file_id) = download_queue.mark_as_done_and_get_new(&update.file().id()) {
-                trace!("file {} downloading started", file_id);
-                if let Err(e) = api.download_file(make_download_file_request(file_id)) {
-                    error!("{}", e);
-                }
-            }
-            let mut rt = runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let mut local = channel.lock().await;
-                if let Err(err) = local.send(TgUpdate::FileDownloaded(update.clone())).await {
-                    error!("{}", err);
-                };
-            });
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 pub enum TgUpdate {
     NewMessage(UpdateNewMessage),
@@ -536,11 +658,10 @@ mod tests {
     use crate::tg_client::{get_update_file_handler, TgClient};
     use crate::traits;
     use async_trait::async_trait;
-    use rtdlib::errors::{RTDError, RTDResult};
-    use rtdlib::types::*;
+    use rust_tdlib::client::api::Api;
+    use rust_tdlib::errors::{RTDError, RTDResult};
+    use rust_tdlib::types::*;
     use std::sync::{Arc, Condvar, Mutex};
-    use telegram_client::api::aevent::EventApi;
-    use telegram_client::api::Api;
     use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
 
     #[derive(Clone)]
@@ -599,6 +720,7 @@ mod tests {
     async fn test_download_file() {
         let mut client = TgClient::new(&Config {
             max_download_queue_size: 1,
+            log_download_state_secs_interval: 100,
             log_verbosity_level: 0,
             database_directory: "".to_string(),
             api_id: 0,

@@ -8,4 +8,4 @@ pub mod tg_client;
 mod traits;
 pub mod types;
 
-pub use ::rtdlib::types::*;
+pub use rust_tdlib::types::*;

@@ -1,4 +1,4 @@
-use rtdlib::types::{
+use rust_tdlib::types::{
     Animation, Audio, Chat, File, PhotoSize, Poll, PollOption, Sticker, Supergroup,
     SupergroupFullInfo, Video, VideoNote,
 };

@@ -2,7 +2,7 @@ use crate::result::Result;
 use crate::tg_client::TgUpdate;
 use crate::types::*;
 use async_trait::async_trait;
-use rtdlib::types::{FormattedText, MessageContent};
+use rust_tdlib::types::{FormattedText, MessageContent};
 
 #[async_trait]
 pub trait TelegramDataParser {

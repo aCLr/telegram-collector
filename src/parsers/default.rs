@@ -3,8 +3,9 @@ use crate::result::{Error, Result};
 use crate::tg_client::TgUpdate;
 use crate::types::*;
 use async_trait::async_trait;
-use rtdlib::types::{FormattedText, MessageContent, RObject, TextEntity, TextEntityType};
+use rust_tdlib::types::{FormattedText, MessageContent, RObject, TextEntity, TextEntityType};
 
+#[derive(Clone)]
 pub struct DefaultTelegramParser {}
 
 impl DefaultTelegramParser {
